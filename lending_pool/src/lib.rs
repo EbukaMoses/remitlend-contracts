@@ -94,9 +94,12 @@ pub struct PoolStats {
     pub total_shares: i128,
     pub pool_token_balance: i128,
     pub depositor_count: u32,
-    /// Fraction of tracked principal currently out on loan, in basis points.
-    /// Only positive when active loans have reduced pool_balance below
-    /// total_deposits.
+    /// `(total_deposits − pool_token_balance) / total_deposits × 10 000`.
+    /// Positive only when outstanding loans have reduced pool_balance below
+    /// tracked principal.  Note: accrued yield increases pool_balance, which
+    /// partially offsets outstanding loans in this formula — utilisation may
+    /// therefore understate the true loan fraction when significant yield has
+    /// accumulated relative to outstanding principal.
     pub utilization_bps: u32,
 }
 
@@ -376,7 +379,7 @@ impl LendingPool {
             let count = Self::read_depositor_count(env, token);
             env.storage().instance().set(
                 &DataKey::DepositorCount(token.clone()),
-                &count.saturating_sub(1),
+                &count.checked_sub(1).expect("depositor_count underflow"),
             );
         } else {
             env.storage().persistent().set(&share_key, &remaining);
