@@ -1915,7 +1915,7 @@ fn test_total_deposits_zero_after_all_shares_redeemed_with_yield() {
 
     pool_client.deposit(&provider_a, &token_id, &1_000); // 1000 shares
     pool_client.deposit(&provider_b, &token_id, &1_000); // 1000 shares
-    // managed = 2000, total_shares = 2000, TotalDeposits = 2000.
+                                                         // managed = 2000, total_shares = 2000, TotalDeposits = 2000.
 
     // 1000 tokens of yield arrive; record_yield updates TotalManagedAssets.
     stellar_asset_client.mint(&pool_id, &1_000);
