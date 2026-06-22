@@ -10,13 +10,13 @@ use soroban_sdk::{
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// Minimum timelock: 24 hours. Cannot be overridden by the proposing admin.
-const MIN_TIMELOCK_SECONDS: u64 = 86_400;
+pub const MIN_TIMELOCK_SECONDS: u64 = 86_400;
 
 /// Maximum signers in a quorum — keeps storage and iteration bounded.
-const MAX_SIGNERS: u32 = 20;
+pub const MAX_SIGNERS: u32 = 20;
 
 /// Time-to-live for proposals before they expire (7 days in seconds).
-const PROPOSAL_TTL_SECONDS: u64 = 604_800;
+pub const PROPOSAL_TTL_SECONDS: u64 = 604_800;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -27,7 +27,7 @@ const KEY_TARGET: Symbol = symbol_short!("TARGET");
 const KEY_LAST_CANCELLED_AT: Symbol = symbol_short!("CANCEL_AT");
 const KEY_PROPOSAL_COUNT: Symbol = symbol_short!("COUNT");
 
-const REPROPOSAL_COOLDOWN_SECONDS: u64 = 3600; // 1 hour
+pub const REPROPOSAL_COOLDOWN_SECONDS: u64 = 3600; // 1 hour
 const CURRENT_VERSION: u32 = 1;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -129,6 +129,15 @@ pub struct GovernanceContract;
 
 #[contractimpl]
 impl GovernanceContract {
+    const INSTANCE_TTL_THRESHOLD: u32 = 17280; // ~1 day (5s ledgers)
+    const INSTANCE_TTL_BUMP: u32 = 518400; // ~30 days (5s ledgers)
+
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_BUMP);
+    }
+
     // ── Initialization ────────────────────────────────────────────────────────
 
     /// Initialize the governance contract.
@@ -143,15 +152,18 @@ impl GovernanceContract {
         env.storage().instance().set(&KEY_TARGET, &target_contract);
         env.storage().instance().set(&KEY_VERSION, &CURRENT_VERSION);
         env.storage().instance().set(&KEY_PROPOSAL_COUNT, &0u32);
+        Self::bump_instance_ttl(&env);
     }
 
     pub fn version(env: Env) -> u32 {
+        Self::bump_instance_ttl(&env);
         env.storage().instance().get(&KEY_VERSION).unwrap_or(0)
     }
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin = Self::read_admin(&env);
         admin.require_auth();
+        Self::bump_instance_ttl(&env);
 
         let old_version = Self::version(env.clone());
         let new_version = old_version.saturating_add(1);
@@ -182,6 +194,7 @@ impl GovernanceContract {
     ) {
         let admin = Self::read_admin(&env);
         admin.require_auth();
+        Self::bump_instance_ttl(&env);
 
         if let Some(pending) = env
             .storage()
@@ -284,6 +297,7 @@ impl GovernanceContract {
     /// Soroban's require_auth guarantees the caller genuinely controls `signer`.
     pub fn approve_transfer(env: Env, signer: Address) {
         signer.require_auth();
+        Self::bump_instance_ttl(&env);
 
         let mut pending: PendingTransfer = env
             .storage()
@@ -335,6 +349,7 @@ impl GovernanceContract {
     /// and must verify the caller is this governance contract address.
     pub fn finalize_admin_transfer(env: Env, caller: Address) {
         caller.require_auth();
+        Self::bump_instance_ttl(&env);
 
         let pending: PendingTransfer = env
             .storage()
@@ -408,6 +423,7 @@ impl GovernanceContract {
     pub fn cancel_admin_transfer(env: Env) {
         let admin = Self::read_admin(&env);
         admin.require_auth();
+        Self::bump_instance_ttl(&env);
 
         let mut pending: PendingTransfer = env
             .storage()
@@ -444,6 +460,7 @@ impl GovernanceContract {
     ) {
         let admin = Self::read_admin(&env);
         admin.require_auth();
+        Self::bump_instance_ttl(&env);
 
         let mut pending: PendingTransfer = env
             .storage()
@@ -486,6 +503,7 @@ impl GovernanceContract {
     /// This cleans up stale proposals and allows new ones to be created.
     pub fn expire_proposal(env: Env, caller: Address) {
         caller.require_auth();
+        Self::bump_instance_ttl(&env);
 
         let pending: PendingTransfer = env
             .storage()
@@ -527,6 +545,7 @@ impl GovernanceContract {
     }
 
     pub fn get_target(env: Env) -> Address {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&KEY_TARGET)
@@ -534,6 +553,7 @@ impl GovernanceContract {
     }
 
     pub fn get_pending_transfer(env: Env) -> PendingTransfer {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&KEY_PENDING)
@@ -541,10 +561,12 @@ impl GovernanceContract {
     }
 
     pub fn get_pending(env: Env) -> Option<PendingTransfer> {
+        Self::bump_instance_ttl(&env);
         env.storage().instance().get(&KEY_PENDING)
     }
 
     pub fn has_pending_transfer(env: Env) -> bool {
+        Self::bump_instance_ttl(&env);
         if let Some(pending) = env
             .storage()
             .instance()
@@ -557,6 +579,7 @@ impl GovernanceContract {
     }
 
     pub fn get_approval_count(env: Env) -> u32 {
+        Self::bump_instance_ttl(&env);
         let pending: PendingTransfer = env
             .storage()
             .instance()
@@ -568,6 +591,7 @@ impl GovernanceContract {
     /// Returns seconds remaining until the timelock expires.
     /// Returns 0 if already elapsed or no pending transfer exists.
     pub fn get_timelock_remaining(env: Env) -> u64 {
+        Self::bump_instance_ttl(&env);
         match env
             .storage()
             .instance()
@@ -601,6 +625,7 @@ impl GovernanceContract {
     }
 
     fn read_admin(env: &Env) -> Address {
+        Self::bump_instance_ttl(env);
         env.storage()
             .instance()
             .get(&KEY_ADMIN)

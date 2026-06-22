@@ -26,6 +26,8 @@ pub trait RateOracleInterface {
 pub trait LendingPoolInterface {
     fn is_paused(env: Env) -> bool;
     fn pool_balance(env: Env, token: Address) -> i128;
+    fn record_yield(env: Env, token: Address, amount: i128);
+    fn get_loan_manager(env: Env, token: Address) -> Option<Address>;
 }
 
 mod events;
@@ -60,6 +62,7 @@ pub enum LoanError {
     InvalidExtension = 25,
     InsufficientCollateral = 26,
     LoanNotLiquidatable = 27,
+    RepaymentBelowMinimum = 28,
 }
 
 #[contracttype]
@@ -352,8 +355,16 @@ impl LoanManager {
             .and_then(|v| v.checked_mul(PRECISION))
             .ok_or(LoanError::AmountTooLarge)?;
 
+        // Issue #4: normalise by the loan's own term, not the contract-wide
+        // default — otherwise loans approved with a non-default term accrue
+        // interest at the wrong rate relative to their stated APR-over-term.
+        let term_ledgers = if loan.term_ledgers == 0 {
+            Self::DEFAULT_TERM_LEDGERS
+        } else {
+            loan.term_ledgers
+        };
         let denominator = 10_000i128
-            .checked_mul(Self::DEFAULT_TERM_LEDGERS as i128)
+            .checked_mul(term_ledgers as i128)
             .ok_or(LoanError::AmountTooLarge)?;
 
         let total_interest = numerator / denominator;
@@ -505,12 +516,38 @@ impl LoanManager {
             .checked_add(delta)
             .expect("total outstanding overflow");
 
+        // This can only become negative if the contract state is inconsistent:
+        // repayment logic only ever subtracts the exact principal amount of a
+        // fully repaid loan, and the corresponding loan-approval bookkeeping
+        // prevents a second subtraction from the same outstanding balance.
         if updated < 0 {
             panic!("total outstanding underflow");
         }
 
         env.storage().instance().set(&key, &updated);
         Self::bump_instance_ttl(env);
+    }
+
+    /// Credit realized yield (loan interest, late fees, extension fees) to the
+    /// lending pool's LP share price.
+    ///
+    /// Since the pool now derives share value from internally-tracked managed
+    /// assets rather than its raw balance (lending_pool issue #2), interest that
+    /// is merely transferred into the pool would otherwise sit as uncounted
+    /// surplus and never reach depositors. This reports it explicitly.
+    ///
+    /// Best-effort and non-fatal: it only calls the pool when this manager is the
+    /// pool's configured yield reporter (otherwise the pool would reject the call
+    /// and revert the repayment), and it swallows any pool-side error (e.g. no LP
+    /// shares outstanding) so yield accounting can never block a repayment.
+    fn report_yield_to_pool(env: &Env, lending_pool: &Address, token: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let pool_client = PoolClient::new(env, lending_pool);
+        if pool_client.get_loan_manager(token) == Some(env.current_contract_address()) {
+            let _ = pool_client.try_record_yield(token, &amount);
+        }
     }
 
     fn borrower_loan_count(env: &Env, borrower: &Address) -> u32 {
@@ -580,11 +617,18 @@ impl LoanManager {
         }
 
         let overdue_ledgers = current_ledger - late_fee_start;
+        // Issue #4: normalise by the loan's own term rather than the
+        // contract-wide default.
+        let term_ledgers = if loan.term_ledgers == 0 {
+            Self::DEFAULT_TERM_LEDGERS
+        } else {
+            loan.term_ledgers
+        };
         let incremental_fee = debt_before_late_fees
             .checked_mul(Self::late_fee_rate_bps(env) as i128)
             .and_then(|value| value.checked_mul(overdue_ledgers as i128))
             .and_then(|value| value.checked_div(10_000))
-            .and_then(|value| value.checked_div(Self::DEFAULT_TERM_LEDGERS as i128))
+            .and_then(|value| value.checked_div(term_ledgers as i128))
             .expect("late fee overflow");
 
         // Global debt cap: Total outstanding (principal + interest + late fees)
@@ -1100,7 +1144,15 @@ impl LoanManager {
             .instance()
             .get(&DataKey::Token)
             .expect("token not set");
-        let term_ledgers = Self::read_default_term(&env);
+        // Issue #5: honour the borrower-requested term that `request_loan`
+        // validated and stored on the loan, instead of overwriting it with the
+        // contract-wide default. Fall back to the default only when the
+        // stored field is 0 (legacy / unset loans).
+        let term_ledgers = if loan.term_ledgers == 0 {
+            Self::read_default_term(&env)
+        } else {
+            loan.term_ledgers
+        };
 
         // Cross-contract READ for liquidity check — still in the CHECKS phase.
         let pool_client = PoolClient::new(&env, &lending_pool);
@@ -1146,6 +1198,8 @@ impl LoanManager {
         Ok(())
     }
 
+    /// Returns a projected (non-persisted) snapshot of the loan, including accrued interest and late fees up to the current ledger.
+    /// This state is NOT written back to storage. For the exact amount required to clear the debt, use `quote_total_debt`.
     pub fn get_loan(env: Env, loan_id: u32) -> Result<Loan, LoanError> {
         let loan_key = DataKey::Loan(loan_id);
         let mut loan: Loan = env
@@ -1156,6 +1210,20 @@ impl LoanManager {
         Self::bump_persistent_ttl(&env, &loan_key);
         let _ = Self::current_total_debt(&env, &mut loan)?;
         Ok(loan)
+    }
+
+    /// Returns the exact current total debt (principal + accrued interest + accrued late fee) for a loan.
+    /// This amount matches exactly what `repay` would charge at the current ledger.
+    pub fn quote_total_debt(env: Env, loan_id: u32) -> Result<i128, LoanError> {
+        let loan_key = DataKey::Loan(loan_id);
+        let mut loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&loan_key)
+            .ok_or(LoanError::LoanNotFound)?;
+        Self::bump_persistent_ttl(&env, &loan_key);
+        let (total_debt, _) = Self::current_total_debt(&env, &mut loan)?;
+        Ok(total_debt)
     }
 
     pub fn repay(env: Env, borrower: Address, loan_id: u32, amount: i128) -> Result<(), LoanError> {
@@ -1207,7 +1275,7 @@ impl LoanManager {
         let is_rounding_dust_forgiveness = total_debt <= min_repayment_amount;
 
         if amount < total_debt && amount < min_repayment_amount && !is_rounding_dust_forgiveness {
-            panic!("repayment amount below minimum");
+            return Err(LoanError::RepaymentBelowMinimum);
         }
 
         let token: Address = env
@@ -1287,6 +1355,14 @@ impl LoanManager {
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&borrower, &lending_pool, &amount);
 
+        // The interest and late-fee portions of the repayment are yield to LPs;
+        // the principal portion just returns borrowed principal. Credit only the
+        // yield so the pool's share price reflects earnings (lending_pool #2).
+        let yield_portion = interest_payment
+            .checked_add(late_fee_payment)
+            .expect("yield portion overflow");
+        Self::report_yield_to_pool(&env, &lending_pool, &token, yield_portion);
+
         if completed {
             // release_collateral_internal reads collateral from storage and performs
             // its own CEI, so it is safe to call after the loan state is committed.
@@ -1353,7 +1429,7 @@ impl LoanManager {
         }
 
         let loan_key = DataKey::Loan(loan_id);
-        let loan: Loan = env
+        let mut loan: Loan = env
             .storage()
             .persistent()
             .get(&loan_key)
@@ -1380,27 +1456,32 @@ impl LoanManager {
             .storage()
             .instance()
             .get(&DataKey::Token)
-            .expect("token not set");
+            .ok_or(LoanError::NotInitialized)?;
         let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(&loan.borrower, &env.current_contract_address(), &amount);
-
-        let loan_key = DataKey::Loan(loan_id);
-        let mut loan: Loan = env
-            .storage()
-            .persistent()
-            .get(&loan_key)
-            .expect("loan not found");
 
         let updated_collateral = loan
             .collateral_amount
             .checked_add(amount)
-            .expect("collateral overflow");
+            .ok_or(LoanError::AmountTooLarge)?;
         loan.collateral_amount = updated_collateral;
         env.storage().persistent().set(&loan_key, &loan);
         Self::bump_persistent_ttl(&env, &loan_key);
 
+        // CEI: commit the updated loan state before the external token transfer.
+        token_client.transfer(&loan.borrower, &env.current_contract_address(), &amount);
+
+        // Re-validate after the external interaction with typed errors rather than panicking.
+        let stored_loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&loan_key)
+            .ok_or(LoanError::LoanNotFound)?;
+        if stored_loan.status != LoanStatus::Approved {
+            return Err(LoanError::LoanNotActive);
+        }
+
         env.events().publish(
-            (symbol_short!("ColDep"), loan_id, loan.borrower),
+            (symbol_short!("ColDep"), loan_id, stored_loan.borrower),
             updated_collateral,
         );
 
@@ -1518,6 +1599,14 @@ impl LoanManager {
 
         if debt_repaid > 0 {
             token_client.transfer(&env.current_contract_address(), &lending_pool, &debt_repaid);
+            // NOTE: liquidation yield (recovered interest/late fees) is NOT
+            // reported to the pool here. Unlike a normal repayment, a liquidation
+            // can also leave a principal shortfall, and crediting the recovered
+            // interest as yield without a paired principal write-off would
+            // *inflate* LP share value during a loss event. Correct handling
+            // needs a `record_loss` companion in the pool; tracked as a
+            // follow-up to lending_pool #2. Recovered funds still sit in the pool
+            // as (uncounted) surplus, which is conservative/safe for LPs.
         }
         if liquidator_bonus > 0 {
             token_client.transfer(
@@ -1571,6 +1660,7 @@ impl LoanManager {
         loan.collateral_amount = 0;
         env.storage().persistent().set(&loan_key, &loan);
         Self::bump_persistent_ttl(&env, &loan_key);
+        Self::decrement_borrower_loan_count(&env, &borrower);
 
         if collateral_to_release > 0 {
             use soroban_sdk::token::TokenClient;
@@ -1613,6 +1703,7 @@ impl LoanManager {
         loan.collateral_amount = 0;
         env.storage().persistent().set(&loan_key, &loan);
         Self::bump_persistent_ttl(&env, &loan_key);
+        Self::decrement_borrower_loan_count(&env, &loan.borrower);
 
         if collateral_to_release > 0 {
             use soroban_sdk::token::TokenClient;
@@ -1974,16 +2065,16 @@ impl LoanManager {
         Self::max_loan_amount(&env)
     }
 
-    pub fn set_min_repayment_amount(env: Env, amount: i128) {
+    pub fn set_min_repayment_amount(env: Env, amount: i128) -> Result<(), LoanError> {
         if amount < 0 {
-            panic!("min repayment amount cannot be negative");
+            return Err(LoanError::InvalidAmount);
         }
 
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialized");
+            .ok_or(LoanError::NotInitialized)?;
         admin.require_auth();
 
         let old_amount = Self::min_repayment_amount(&env);
@@ -1992,6 +2083,8 @@ impl LoanManager {
             .set(&DataKey::MinRepaymentAmount, &amount);
         Self::bump_instance_ttl(&env);
         events::min_repayment_updated(&env, admin, old_amount, amount);
+
+        Ok(())
     }
 
     pub fn get_min_repayment_amount(env: Env) -> i128 {
@@ -2411,6 +2504,10 @@ impl LoanManager {
                 .expect("lending pool not set");
             let token_client = TokenClient::new(&env, &token);
             token_client.transfer(&borrower, &lending_pool, &extension_fee);
+
+            // The extension fee is pure income to the pool — credit it as yield
+            // so it accrues to LP share value (lending_pool #2).
+            Self::report_yield_to_pool(&env, &lending_pool, &token, extension_fee);
         }
 
         // Extend the due date
